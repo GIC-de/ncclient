@@ -18,9 +18,6 @@ import sys
 import socket
 import getpass
 from binascii import hexlify
-import sys
-from six import StringIO
-from io import BytesIO
 from lxml import etree
 from select import select
 
@@ -38,6 +35,7 @@ logger = logging.getLogger("ncclient.transport.ssh")
 BUF_SIZE = 4096
 # v1.0: RFC 4742
 MSG_DELIM = "]]>]]>"
+MSG_DELIM_LEN = len(MSG_DELIM)
 # v1.1: RFC 6242
 END_DELIM = '\n##\n'
 
@@ -63,6 +61,20 @@ def _colonify(fp):
         finga += ":" + fp[idx:idx+2]
     return finga
 
+if sys.version < '3':
+    def textify(buf):
+        return buf
+else:
+    def textify(buf):
+        return buf.decode('UTF-8')
+
+if sys.version < '3':
+    from six import StringIO
+else:
+    from io import BytesIO as StringIO
+
+
+
 class SSHSession(Session):
 
     "Implements a :rfc:`4742` NETCONF session over SSH."
@@ -76,10 +88,7 @@ class SSHSession(Session):
         self._channel = None
         self._channel_id = None
         self._channel_name = None
-        if sys.version<'3':
-            self._buffer = StringIO() # for incoming data
-        else:
-            self._buffer = BytesIO() # for incoming data
+        self._buffer = StringIO()
         # parsing-related, see _parse()
         self._device_handler = device_handler
         self._parsing_state10 = 0
@@ -100,58 +109,34 @@ class SSHSession(Session):
 
         """Messages are delimited by MSG_DELIM. The buffer could have grown by
         a maximum of BUF_SIZE bytes everytime this method is called. Retains
-        state across method calls and if a byte has been read it will not be
+        state across method calls and if a chunk has been read it will not be
         considered again."""
 
         logger.debug("parsing netconf v1.0")
-        delim = MSG_DELIM
-        n = len(delim) - 1
-        expect = self._parsing_state10
         buf = self._buffer
         buf.seek(self._parsing_pos10)
-        while True:
-            x = buf.read(1)
-            if isinstance(x, bytes):
-                x = x.decode('UTF-8')
-            if not x: # done reading
-                break
-            elif x == delim[expect]: # what we expected
-                expect += 1 # expect the next delim char
+        if MSG_DELIM in buf.read().decode('UTF-8'):
+            buf.seek(0)
+            msg, _, remaining = buf.read().decode('UTF-8').partition(MSG_DELIM)
+            msg = msg.strip()
+            if sys.version < '3':
+                self._dispatch_message(msg.encode())
             else:
-                expect = 0
-                continue
-            # loop till last delim char expected, break if other char encountered
-            for i in range(expect, n):
-                x = buf.read(1)
-                if isinstance(x, bytes):
-                    x = x.decode('UTF-8')
-                if not x: # done reading
-                    break
-                if x == delim[expect]: # what we expected
-                    expect += 1 # expect the next delim char
-                else:
-                    expect = 0 # reset
-                    break
-            else: # if we didn't break out of the loop, full delim was parsed
-                msg_till = buf.tell() - n
-                buf.seek(0)
-                logger.debug('parsed new message')
-                if sys.version < '3':
-                    self._dispatch_message(buf.read(msg_till).strip())
-                    buf.seek(n+1, os.SEEK_CUR)
-                    rest = buf.read()
-                    buf = StringIO()
-                else:
-                    self._dispatch_message(buf.read(msg_till).strip().decode('UTF-8'))
-                    buf.seek(n+1, os.SEEK_CUR)
-                    rest = buf.read()
-                    buf = BytesIO()
-                buf.write(rest)
-                buf.seek(0)
-                expect = 0
-        self._buffer = buf
-        self._parsing_state10 = expect
-        self._parsing_pos10 = self._buffer.tell()
+                self._dispatch_message(msg)
+            # create new buffer which contains remaining of old buffer
+            self._buffer = StringIO()
+            self._buffer.write(remaining.encode())
+            self._parsing_pos10 = 0
+            if len(remaining) > 0:
+                # There could be another entire message in the
+                # buffer, so we should try to parse again.
+                logger.debug('Trying another round of parsing since there is still data')
+                self._parse10()
+        else:
+            # handle case that MSG_DELIM is split over two chunks
+            self._parsing_pos10 = buf.tell() - MSG_DELIM_LEN
+            if self._parsing_pos10 < 0:
+                self._parsing_pos10 = 0
 
     def _parse11(self):
         logger.debug("parsing netconf v1.1")
@@ -168,17 +153,19 @@ class SSHSession(Session):
         message_list = self._message_list # a message is a list of chunks
         chunk_list = []   # a chunk is a list of characters
 
+        should_recurse = False
+
         while True:
             x = buf.read(1)
             if not x:
                 logger.debug('No more data to read')
                 # Store the current chunk to the message list
-                chunk = ''.join(chunk_list)
-                message_list.append(chunk)
+                chunk = b''.join(chunk_list)
+                message_list.append(textify(chunk))
                 break # done reading
             logger.debug('x: %s', x)
             if state == idle:
-                if x == '\n':
+                if x == b'\n':
                     state = instart
                     inendpos = 1
                 else:
@@ -186,7 +173,7 @@ class SSHSession(Session):
                     raise Exception
             elif state == instart:
                 if inendpos == 1:
-                    if x == '#':
+                    if x == b'#':
                         inendpos += 1
                     else:
                         logger.debug('%s (%s: expect "#")'%(pre, state))
@@ -202,10 +189,10 @@ class SSHSession(Session):
                     if inendpos == MAX_STARTCHUNK_SIZE:
                         logger.debug('%s (%s: no. too long)'%(pre, state))
                         raise Exception
-                    elif x == '\n':
-                        num = ''.join(num_list)
+                    elif x == b'\n':
+                        num = b''.join(num_list)
                         num_list = [] # Reset num_list
-                        try: num = long(num)
+                        try: num = int(num)
                         except:
                             logger.debug('%s (%s: invalid no.)'%(pre, state))
                             raise Exception
@@ -219,7 +206,7 @@ class SSHSession(Session):
                         inendpos += 1 # > 3 now #
                         num_list.append(x)
                     else:
-                        log.debug('%s (%s: expect digit)'%(pre, state))
+                        logger.debug('%s (%s: expect digit)'%(pre, state))
                         raise Exception
             elif state == inmsg:
                 chunk_list.append(x)
@@ -228,24 +215,24 @@ class SSHSession(Session):
                 if chunkleft == 0:
                     inendpos = 0
                     state = inbetween
-                    chunk = ''.join(chunk_list)
-                    message_list.append(chunk)
-                    chunk_list = [] # Reset chunk_list    
+                    chunk = b''.join(chunk_list)
+                    message_list.append(textify(chunk))
+                    chunk_list = [] # Reset chunk_list
                     logger.debug('parsed new chunk: %s'%(chunk))
             elif state == inbetween:
                 if inendpos == 0:
-                    if x == '\n': inendpos += 1
+                    if x == b'\n': inendpos += 1
                     else:
                         logger.debug('%s (%s: expect newline)'%(pre, state))
                         raise Exception
                 elif inendpos == 1:
-                    if x == '#': inendpos += 1
+                    if x == b'#': inendpos += 1
                     else:
                         logger.debug('%s (%s: expect "#")'%(pre, state))
                         raise Exception
                 else:
                     inendpos += 1 # == 3 now #
-                    if x == '#':
+                    if x == b'#':
                         state = inend
                     elif x.isdigit():
                         # More trunks
@@ -257,14 +244,14 @@ class SSHSession(Session):
                         raise Exception
             elif state == inend:
                 if inendpos == 3:
-                    if x == '\n':
+                    if x == b'\n':
                         inendpos = 0
                         state = idle
                         logger.debug('dispatching message')
                         self._dispatch_message(''.join(message_list))
                         # reset
                         rest = buf.read()
-                        buf = StringIO()
+                        buf = BytesIO()
                         buf.write(rest)
                         buf.seek(0)
                         message_list = []
@@ -273,6 +260,9 @@ class SSHSession(Session):
                         expchunksize = chunksize = 0
                         parsing_state11 = idle
                         inendpos = parsing_pos11 = 0
+                        # There could be another entire message in the
+                        # buffer, so we should try to parse again.
+                        should_recurse = True
                         break
                     else:
                         logger.debug('%s (%s: expect newline)'%(pre, state))
@@ -289,6 +279,10 @@ class SSHSession(Session):
         self._buffer = buf
         self._parsing_pos11 = self._buffer.tell()
         logger.debug('parse11 ending ...')
+
+        if should_recurse:
+            logger.debug('Trying another round of parsing since there is still data')
+            self._parse11()
 
 
     def load_known_hosts(self, filename=None):
@@ -318,7 +312,7 @@ class SSHSession(Session):
             self._transport.close()
         self._channel = None
         self._connected = False
-        
+
 
     # REMEMBER to update transport.rst if sig. changes, since it is hardcoded there
     def connect(self, host, port=830, timeout=None, unknown_host_cb=default_unknown_host_cb,
@@ -446,7 +440,7 @@ class SSHSession(Session):
         saved_exception = None
 
         for key_filename in key_filenames:
-            for cls in (paramiko.RSAKey, paramiko.DSSKey):
+            for cls in (paramiko.RSAKey, paramiko.DSSKey, paramiko.ECDSAKey):
                 try:
                     key = cls.from_private_key_file(key_filename, password)
                     logger.debug("Trying key %s from %s" %
@@ -472,17 +466,23 @@ class SSHSession(Session):
         if look_for_keys:
             rsa_key = os.path.expanduser("~/.ssh/id_rsa")
             dsa_key = os.path.expanduser("~/.ssh/id_dsa")
+            ecdsa_key = os.path.expanduser("~/.ssh/id_ecdsa")
             if os.path.isfile(rsa_key):
                 keyfiles.append((paramiko.RSAKey, rsa_key))
             if os.path.isfile(dsa_key):
                 keyfiles.append((paramiko.DSSKey, dsa_key))
+            if os.path.isfile(ecdsa_key):
+                keyfiles.append((paramiko.ECDSAKey, ecdsa_key))
             # look in ~/ssh/ for windows users:
             rsa_key = os.path.expanduser("~/ssh/id_rsa")
             dsa_key = os.path.expanduser("~/ssh/id_dsa")
+            ecdsa_key = os.path.expanduser("~/ssh/id_ecdsa")
             if os.path.isfile(rsa_key):
                 keyfiles.append((paramiko.RSAKey, rsa_key))
             if os.path.isfile(dsa_key):
                 keyfiles.append((paramiko.DSSKey, dsa_key))
+            if os.path.isfile(ecdsa_key):
+                keyfiles.append((paramiko.ECDSAKey, ecdsa_key))
 
         for cls, filename in keyfiles:
             try:
